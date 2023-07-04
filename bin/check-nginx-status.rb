@@ -58,8 +58,8 @@ class CheckNginxStatus < Sensu::Plugin::Check::CLI
 
     ok 'Nginx is Alive and healthy' if response.code == '200'
     warning 'Nginx Status endpoint is mis-configured' if response.code == '301'
+    critical "Nginx is error #{response.code}"
+  rescue StandardError
     critical 'Nginx is Down'
-  rescue StandardError => e
-    unknown "Could not fetch Nginx status | #{e.message}"
   end
 end
