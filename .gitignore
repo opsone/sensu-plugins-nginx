@@ -2,6 +2,3 @@
 dist/
 /check-nginx-status
 /integration/check-nginx-status
-
-# Ruby-era local assets
-/assets/
