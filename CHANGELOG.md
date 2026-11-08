@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - 2026-11-08
+
+### Changed
+- Repository cleanup (removed `CLAUDE.md` and an obsolete Ruby-era `.gitignore` rule); no functional change.
+
 ## [0.2.0] - 2026-11-08
 
 ### Changed
