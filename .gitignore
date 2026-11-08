@@ -1,2 +1,7 @@
+# Build outputs (make build / linux / dist)
+dist/
+/check-nginx-status
+/integration/check-nginx-status
+
+# Ruby-era local assets
 /assets/
-/Gemfile.lock
