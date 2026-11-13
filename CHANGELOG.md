@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] - 2026-11-13
+
+### Added
+- `--writing-connections` (`CHECK_NGINX_WRITING_CONNECTIONS`, default 200): warns on requests being processed, the load counter.
+- `--load-grace` (`CHECK_NGINX_LOAD_GRACE`, default 180 seconds): a threshold exceeded is only reported once it lasts this delay; within it the check stays OK and tells it (`… for 1m0s, within grace`).
+- `--state-dir` (`CHECK_NGINX_STATE_DIR`, default `/var/cache/sensu/sensu-agent`): state file of the grace delay. Without usable state file, thresholds exceeded are reported at once with a `grace WARNING` line.
+
+### Changed
+- `--waiting-requests` / `CHECK_NGINX_WAITING_REQUESTS` renamed `--waiting-connections` / `CHECK_NGINX_WAITING_CONNECTIONS` (shorthand `-w` kept), disabled by default (was 30): idle keep-alive connections are no load.
+- A threshold set to 0 disables its test.
+- Output says `waiting connections` instead of `waiting requests`.
+
 ## [0.2.1] - 2026-11-08
 
 ### Changed

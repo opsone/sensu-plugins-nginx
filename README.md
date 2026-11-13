@@ -9,22 +9,40 @@ Static Go binary (no CGO, no Ruby runtime): one asset for every Linux distributi
 | Situation | State |
 |---|---|
 | HTTP 200 with a stub_status page, counters under their thresholds | OK |
-| Active connections > `--active-connections` | WARNING |
-| Waiting connections > `--waiting-requests` | WARNING |
+| Active, writing or waiting connections above their threshold for `--load-grace` | WARNING |
+| Threshold exceeded for less than `--load-grace` | OK (`… for 1m0s, within grace`) |
 | HTTP redirect (3xx, not followed) | WARNING (status endpoint misconfigured) |
 | HTTP 200 but not a stub_status page | WARNING (status endpoint misconfigured) |
 | Any other HTTP code (4xx, 5xx) | CRITICAL |
 | Connection refused, timeout, DNS error | CRITICAL |
 | Invalid argument (missing or invalid URL, negative threshold) | UNKNOWN |
 
-Both thresholds are reported when both are exceeded. The output always carries the counters:
+Every threshold exceeded is reported. The output always carries the counters:
 
 ```
 check-nginx-status OK: active 12, reading 0, writing 1, waiting 11
-check-nginx-status WARNING: waiting requests 106 > 30 (active 291, reading 6, writing 179, waiting 106)
+check-nginx-status OK: active 317, reading 0, writing 1, waiting 316; active connections 317 > 300 for 1m0s, within grace
+check-nginx-status WARNING: writing connections 1782 > 200 for 3m0s (active 2166, reading 0, writing 1782, waiting 93)
 ```
 
-`Waiting` is the number of idle keep-alive connections, as reported by nginx.
+### Counters
+
+The counters of the stub_status page:
+
+- `active`: every open client connection, `reading` + `writing` + `waiting`;
+- `reading`: connections whose request headers are being read;
+- `writing`: requests being processed (upstream wait included) and responses being sent: the load;
+- `waiting`: idle keep-alive connections, waiting for the next request. A client opening many keep-alive connections (bots, HTTP clients) raises them without any load: this threshold is disabled by default.
+
+`--writing-connections` tells a load peak or a slow upstream; `--active-connections` watches the connection capacity (`worker_connections`). A threshold set to 0 disables its test.
+
+### Grace delay
+
+A load peak of a minute (bots, crawl) is not a problem by itself: a threshold exceeded is only reported once it lasts `--load-grace` (default 180 seconds). Within the delay, the check stays OK and its output tells it (`active connections 317 > 300 for 1m0s, within grace`); past it, the duration is given (`writing connections 250 > 200 for 3m12s`). The delay restarts once the counter is back under its threshold.
+
+The check sees one instant: it remembers since when each threshold has been exceeded in a state file, `check-nginx-status.json` in `--state-dir` (default `/var/cache/sensu/sensu-agent`, the agent cache directory, writable by the `sensu` user). Without usable state file, the thresholds exceeded are reported at once with a `grace WARNING` line. A grace of 0 reports at once and uses no state file.
+
+nginx down, HTTP errors and misconfigured status pages are reported at once.
 
 ## Usage
 
@@ -32,9 +50,12 @@ check-nginx-status WARNING: waiting requests 106 > 30 (active 291, reading 6, wr
 check-nginx-status [flags]
 
   -u, --url string               URL of the stub_status page, e.g. http://127.0.0.1/nginx-status (required)
-  -a, --active-connections int   Warn when active connections exceed this value (default 300)
-  -w, --waiting-requests int     Warn when waiting (idle keep-alive) connections exceed this value (default 30)
-      --timeout int              HTTP request timeout in seconds (default 10)
+  -a, --active-connections int    Warn when active connections exceed this value, 0 disables (default 300)
+  -W, --writing-connections int   Warn when writing connections exceed this value, 0 disables (default 200)
+  -w, --waiting-connections int   Warn when waiting (idle keep-alive) connections exceed this value, 0 disables (default 0)
+      --load-grace int            Seconds a counter may stay above its threshold before alerting, 0 reports at once (default 180)
+      --state-dir string          Directory of the grace state file (default "/var/cache/sensu/sensu-agent")
+      --timeout int               HTTP request timeout in seconds (default 10)
 ```
 
 Every option can also be set with an environment variable:
@@ -43,7 +64,10 @@ Every option can also be set with an environment variable:
 |---|---|---|
 | `--url` | `CHECK_NGINX_URL` | `nginx_url` |
 | `--active-connections` | `CHECK_NGINX_ACTIVE_CONNECTIONS` | `nginx_active_connections` |
-| `--waiting-requests` | `CHECK_NGINX_WAITING_REQUESTS` | `nginx_waiting_requests` |
+| `--writing-connections` | `CHECK_NGINX_WRITING_CONNECTIONS` | `nginx_writing_connections` |
+| `--waiting-connections` | `CHECK_NGINX_WAITING_CONNECTIONS` | `nginx_waiting_connections` |
+| `--load-grace` | `CHECK_NGINX_LOAD_GRACE` | `nginx_load_grace` |
+| `--state-dir` | `CHECK_NGINX_STATE_DIR` | — |
 | `--timeout` | `CHECK_NGINX_TIMEOUT` | `nginx_timeout` |
 
 The status page must be exposed by nginx, e.g.:
@@ -63,7 +87,7 @@ Examples:
 
 ```sh
 check-nginx-status -u http://127.0.0.1/nginx-status
-check-nginx-status -u https://127.0.0.1:8443/status -a 1000 -w 200
+check-nginx-status -u https://127.0.0.1:8443/status -a 1000 -W 500 --load-grace 300
 ```
 
 ## Check definition
@@ -86,7 +110,9 @@ spec:
   env_vars:
     - CHECK_NGINX_URL={{ .annotations.nginx_url | default "http://127.0.0.1/nginx-status" }}
     - CHECK_NGINX_ACTIVE_CONNECTIONS={{ .annotations.nginx_active_connections | default "300" }}
-    - CHECK_NGINX_WAITING_REQUESTS={{ .annotations.nginx_waiting_requests | default "30" }}
+    - CHECK_NGINX_WRITING_CONNECTIONS={{ .annotations.nginx_writing_connections | default "200" }}
+    - CHECK_NGINX_WAITING_CONNECTIONS={{ .annotations.nginx_waiting_connections | default "0" }}
+    - CHECK_NGINX_LOAD_GRACE={{ .annotations.nginx_load_grace | default "180" }}
     - CHECK_NGINX_TIMEOUT={{ .annotations.nginx_timeout | default "10" }}
   runtime_assets:
     - opsone/sensu-plugins-nginx
@@ -102,10 +128,19 @@ Annotations, all optional, e.g. in the agent configuration (`/etc/sensu/agent.ym
 ```yaml
 annotations:
   nginx_url: http://127.0.0.1:8080/nginx-status   # default http://127.0.0.1/nginx-status
-  nginx_active_connections: "1000"                # default 300
-  nginx_waiting_requests: "200"                   # default 30
+  nginx_active_connections: "1000"                # default 300, 0 disables
+  nginx_writing_connections: "500"                # default 200, 0 disables
+  nginx_waiting_connections: "1000"               # default 0 (disabled)
+  nginx_load_grace: "300"                         # seconds, default 180
   nginx_timeout: "5"                              # seconds, default 10
 ```
+
+## Migrating from 0.2.x
+
+- `--waiting-requests` / `CHECK_NGINX_WAITING_REQUESTS` is renamed `--waiting-connections` / `CHECK_NGINX_WAITING_CONNECTIONS` (shorthand `-w` unchanged), disabled by default (it was 30): idle keep-alive connections are no load.
+- New `--writing-connections` (default 200).
+- A threshold set to 0 disables its test (it warned on any connection).
+- Thresholds exceeded are only reported after `--load-grace` (default 180 seconds); 0 keeps the 0.2.x behavior.
 
 ## Migrating from the Ruby version (0.1.0)
 

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sensu/sensu-plugin-sdk/sensu"
 )
@@ -30,8 +31,10 @@ func TestParseStubStatus(t *testing.T) {
 	}
 }
 
+var now = time.Date(2026, 11, 13, 8, 0, 0, 0, time.UTC)
+
 func TestEvaluate(t *testing.T) {
-	defaults := Thresholds{Active: 300, Waiting: 30}
+	defaults := Thresholds{Active: 300, Writing: 200}
 	tests := []struct {
 		name     string
 		code     int
@@ -41,11 +44,13 @@ func TestEvaluate(t *testing.T) {
 		state    int
 		contains string
 	}{
-		{"healthy", 200, "", stubStatus, Thresholds{Active: 300, Waiting: 200}, sensu.CheckStateOK, "active 291, reading 6, writing 179, waiting 106"},
-		{"threshold equal is ok", 200, "", stubStatus, Thresholds{Active: 291, Waiting: 106}, sensu.CheckStateOK, "active 291"},
-		{"waiting over", 200, "", stubStatus, defaults, sensu.CheckStateWarning, "waiting requests 106 > 30"},
-		{"active over", 200, "", stubStatus, Thresholds{Active: 100, Waiting: 200}, sensu.CheckStateWarning, "active connections 291 > 100"},
-		{"both over", 200, "", stubStatus, Thresholds{Active: 0, Waiting: 0}, sensu.CheckStateWarning, "active connections 291 > 0, waiting requests 106 > 0"},
+		{"healthy", 200, "", stubStatus, defaults, sensu.CheckStateOK, "active 291, reading 6, writing 179, waiting 106"},
+		{"threshold equal is ok", 200, "", stubStatus, Thresholds{Active: 291, Writing: 179, Waiting: 106}, sensu.CheckStateOK, "active 291"},
+		{"all disabled", 200, "", stubStatus, Thresholds{}, sensu.CheckStateOK, "active 291"},
+		{"active over", 200, "", stubStatus, Thresholds{Active: 100}, sensu.CheckStateWarning, "active connections 291 > 100 ("},
+		{"writing over", 200, "", stubStatus, Thresholds{Writing: 100}, sensu.CheckStateWarning, "writing connections 179 > 100 ("},
+		{"waiting over", 200, "", stubStatus, Thresholds{Waiting: 30}, sensu.CheckStateWarning, "waiting connections 106 > 30 ("},
+		{"all over", 200, "", stubStatus, Thresholds{Active: 1, Writing: 1, Waiting: 1}, sensu.CheckStateWarning, "active connections 291 > 1, writing connections 179 > 1, waiting connections 106 > 1"},
 		{"not stub_status", 200, "", "<html></html>", defaults, sensu.CheckStateWarning, "not a stub_status page"},
 		{"301", 301, "https://example.com/nginx-status", "", defaults, sensu.CheckStateWarning, "HTTP 301 to https://example.com/nginx-status"},
 		{"302", 302, "", "", defaults, sensu.CheckStateWarning, "misconfigured: HTTP 302"},
@@ -54,7 +59,7 @@ func TestEvaluate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := evaluate(tt.code, tt.location, tt.body, tt.t)
+			got := evaluate(tt.code, tt.location, tt.body, tt.t, now, nil)
 			if got.State != tt.state || !strings.Contains(got.Message, tt.contains) {
 				t.Errorf("got %d %q, want %d containing %q", got.State, got.Message, tt.state, tt.contains)
 			}

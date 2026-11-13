@@ -17,10 +17,13 @@ import (
 // Config represents the check plugin config.
 type Config struct {
 	sensu.PluginConfig
-	URL               string
-	ActiveConnections int
-	WaitingRequests   int
-	Timeout           int
+	URL                string
+	ActiveConnections  int
+	WritingConnections int
+	WaitingConnections int
+	LoadGrace          int
+	StateDir           string
+	Timeout            int
 }
 
 var (
@@ -47,17 +50,42 @@ var (
 			Argument:  "active-connections",
 			Shorthand: "a",
 			Default:   300,
-			Usage:     "Warn when active connections exceed this value",
+			Usage:     "Warn when active connections (reading, writing and waiting) exceed this value (0: disabled)",
 			Value:     &plugin.ActiveConnections,
 		},
 		&sensu.PluginConfigOption[int]{
-			Path:      "waiting-requests",
-			Env:       "CHECK_NGINX_WAITING_REQUESTS",
-			Argument:  "waiting-requests",
+			Path:      "writing-connections",
+			Env:       "CHECK_NGINX_WRITING_CONNECTIONS",
+			Argument:  "writing-connections",
+			Shorthand: "W",
+			Default:   200,
+			Usage:     "Warn when writing connections (requests being processed) exceed this value (0: disabled)",
+			Value:     &plugin.WritingConnections,
+		},
+		&sensu.PluginConfigOption[int]{
+			Path:      "waiting-connections",
+			Env:       "CHECK_NGINX_WAITING_CONNECTIONS",
+			Argument:  "waiting-connections",
 			Shorthand: "w",
-			Default:   30,
-			Usage:     "Warn when waiting (idle keep-alive) connections exceed this value",
-			Value:     &plugin.WaitingRequests,
+			Default:   0,
+			Usage:     "Warn when waiting (idle keep-alive) connections exceed this value (0: disabled)",
+			Value:     &plugin.WaitingConnections,
+		},
+		&sensu.PluginConfigOption[int]{
+			Path:     "load-grace",
+			Env:      "CHECK_NGINX_LOAD_GRACE",
+			Argument: "load-grace",
+			Default:  180,
+			Usage:    "Seconds a counter may stay above its threshold before alerting (0: immediately)",
+			Value:    &plugin.LoadGrace,
+		},
+		&sensu.PluginConfigOption[string]{
+			Path:     "state-dir",
+			Env:      "CHECK_NGINX_STATE_DIR",
+			Argument: "state-dir",
+			Default:  "/var/cache/sensu/sensu-agent",
+			Usage:    "Directory of the file remembering the thresholds exceeded under the grace delay (writable by the agent user)",
+			Value:    &plugin.StateDir,
 		},
 		&sensu.PluginConfigOption[int]{
 			Path:     "timeout",
@@ -82,11 +110,16 @@ func checkArgs(event *corev2.Event) (int, error) {
 	if err := validateURL(plugin.URL); err != nil {
 		return sensu.CheckStateUnknown, err
 	}
-	if plugin.ActiveConnections < 0 {
-		return sensu.CheckStateUnknown, fmt.Errorf("--active-connections must not be negative")
+	for name, v := range map[string]int{
+		"active-connections": plugin.ActiveConnections, "writing-connections": plugin.WritingConnections,
+		"waiting-connections": plugin.WaitingConnections, "load-grace": plugin.LoadGrace,
+	} {
+		if v < 0 {
+			return sensu.CheckStateUnknown, fmt.Errorf("--%s must not be negative", name)
+		}
 	}
-	if plugin.WaitingRequests < 0 {
-		return sensu.CheckStateUnknown, fmt.Errorf("--waiting-requests must not be negative")
+	if plugin.LoadGrace > 0 && plugin.StateDir == "" {
+		return sensu.CheckStateUnknown, fmt.Errorf("--state-dir is required with --load-grace")
 	}
 	if plugin.Timeout <= 0 {
 		return sensu.CheckStateUnknown, fmt.Errorf("--timeout must be greater than 0")
@@ -111,8 +144,22 @@ func executeCheck(event *corev2.Event) (int, error) {
 		if err != nil {
 			result = Result{sensu.CheckStateCritical, fmt.Sprintf("reading %s: %v", plugin.URL, err)}
 		} else {
-			result = evaluate(resp.StatusCode, resp.Header.Get("Location"), string(body),
-				Thresholds{Active: plugin.ActiveConnections, Waiting: plugin.WaitingRequests})
+			th := Thresholds{
+				Active:  plugin.ActiveConnections,
+				Writing: plugin.WritingConnections,
+				Waiting: plugin.WaitingConnections,
+				Grace:   time.Duration(plugin.LoadGrace) * time.Second,
+			}
+			now := time.Now().Truncate(time.Second) // the state keeps whole seconds
+			var tr *Tracker
+			if th.Grace > 0 {
+				tr = LoadTracker(plugin.StateDir, now)
+			}
+			code, location := resp.StatusCode, resp.Header.Get("Location")
+			result = evaluate(code, location, string(body), th, now, tr)
+			if tr.Save() != nil {
+				result = evaluate(code, location, string(body), th, now, tr) // grace state not kept: no grace
+			}
 		}
 	}
 
@@ -152,9 +199,11 @@ func parseStubStatus(body string) (Status, error) {
 	return Status{Active: n(active[1]), Reading: n(queues[1]), Writing: n(queues[2]), Waiting: n(queues[3])}, nil
 }
 
-// Thresholds are the warning limits, exceeded when strictly greater.
+// Thresholds are the warning limits, exceeded when strictly greater; 0 disables a limit. A limit
+// exceeded is only reported once it has lasted Grace.
 type Thresholds struct {
-	Active, Waiting int
+	Active, Writing, Waiting int
+	Grace                    time.Duration
 }
 
 // Result is the outcome of the check.
@@ -163,8 +212,10 @@ type Result struct {
 	Message string
 }
 
-// evaluate turns the HTTP response of the status page into a check result.
-func evaluate(code int, location, body string, t Thresholds) Result {
+// evaluate turns the HTTP response of the status page into a check result. The tracker remembers
+// since when each limit has been exceeded; without it (nil, or unusable state), a limit exceeded is
+// reported at once.
+func evaluate(code int, location, body string, t Thresholds, now time.Time, tr *Tracker) Result {
 	switch {
 	case code >= 300 && code < 400:
 		msg := fmt.Sprintf("status endpoint is misconfigured: HTTP %d", code)
@@ -182,17 +233,45 @@ func evaluate(code int, location, body string, t Thresholds) Result {
 	}
 
 	metrics := fmt.Sprintf("active %d, reading %d, writing %d, waiting %d", s.Active, s.Reading, s.Writing, s.Waiting)
-	var over []string
-	if s.Active > t.Active {
-		over = append(over, fmt.Sprintf("active connections %d > %d", s.Active, t.Active))
+	var over, within []string
+	for _, c := range []struct {
+		key, label   string
+		value, limit int
+	}{
+		{"active", "active connections", s.Active, t.Active},
+		{"writing", "writing connections", s.Writing, t.Writing},
+		{"waiting", "waiting connections", s.Waiting, t.Waiting},
+	} {
+		if c.limit == 0 || c.value <= c.limit {
+			continue
+		}
+		text := fmt.Sprintf("%s %d > %d", c.label, c.value, c.limit)
+		var since time.Time
+		if t.Grace > 0 {
+			since = tr.Since(c.key)
+		}
+		switch d := now.Sub(since).Round(time.Second); {
+		case since.IsZero():
+			over = append(over, text)
+		case d < t.Grace:
+			within = append(within, fmt.Sprintf("%s for %s, within grace", text, d))
+		default:
+			over = append(over, fmt.Sprintf("%s for %s", text, d))
+		}
 	}
-	if s.Waiting > t.Waiting {
-		over = append(over, fmt.Sprintf("waiting requests %d > %d", s.Waiting, t.Waiting))
+
+	if len(within) > 0 {
+		metrics += "; " + strings.Join(within, ", ")
 	}
+	result := Result{sensu.CheckStateOK, metrics}
 	if len(over) > 0 {
-		return Result{sensu.CheckStateWarning, strings.Join(over, ", ") + " (" + metrics + ")"}
+		result = Result{sensu.CheckStateWarning, strings.Join(over, ", ") + " (" + metrics + ")"}
 	}
-	return Result{sensu.CheckStateOK, metrics}
+	if err := tr.Err(); err != nil {
+		result.State = sensu.CheckStateWarning
+		result.Message += fmt.Sprintf("\ngrace WARNING: %v (no grace)", err)
+	}
+	return result
 }
 
 func stateLabel(state int) string {
